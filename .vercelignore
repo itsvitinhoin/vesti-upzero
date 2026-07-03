@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.env*.local
+
+node_modules
+.next
+.DS_Store
+
+kalli-gg-diagnostico.csv
+kalli-gg-diagnostico.json
+preview.png
+tsconfig.tsbuildinfo

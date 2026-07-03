@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.env*.local
+
+.git
+.vercel
+.next
+node_modules
+npm-debug.log*
+
+kalli-gg-diagnostico.csv
+kalli-gg-diagnostico.json
+preview.png
+tsconfig.tsbuildinfo
