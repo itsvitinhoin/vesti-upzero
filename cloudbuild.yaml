@@ -12,7 +12,7 @@ steps:
       - --build-arg
       - NEXT_PUBLIC_USE_CLOUD_RUN_JOBS=true
       - -t
-      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$SHORT_SHA
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$BUILD_ID
       - -t
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:latest
       - .
@@ -23,7 +23,7 @@ steps:
       - run
       - deploy
       - ${_SERVICE_NAME}
-      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$SHORT_SHA
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$BUILD_ID
       - --region=${_REGION}
       - --no-allow-unauthenticated
 
@@ -34,7 +34,7 @@ steps:
       - jobs
       - deploy
       - ${_CATALOG_JOB_NAME}
-      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$SHORT_SHA
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$BUILD_ID
       - --region=${_REGION}
 
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
@@ -44,11 +44,11 @@ steps:
       - jobs
       - deploy
       - ${_COLOR_TERMS_JOB_NAME}
-      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$SHORT_SHA
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$BUILD_ID
       - --region=${_REGION}
 
 images:
-  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:$BUILD_ID
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/app:latest
 
 options:
