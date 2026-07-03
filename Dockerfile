@@ -8,6 +8,12 @@ FROM node:22-alpine AS builder
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 
+# NEXT_PUBLIC_* precisa existir no momento do build (o Next.js grava esse
+# valor dentro do bundle JS do navegador aqui) - setar via --set-env-vars no
+# deploy do Cloud Run NAO afeta esse valor, so as variaveis server-side.
+ARG NEXT_PUBLIC_USE_CLOUD_RUN_JOBS=false
+ENV NEXT_PUBLIC_USE_CLOUD_RUN_JOBS=$NEXT_PUBLIC_USE_CLOUD_RUN_JOBS
+
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build
