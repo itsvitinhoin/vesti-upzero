@@ -75,6 +75,72 @@ function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36)
 }
 
+const USE_CLOUD_RUN_JOBS = process.env.NEXT_PUBLIC_USE_CLOUD_RUN_JOBS === "true"
+const JOB_POLL_INTERVAL_MS = 2000
+
+async function runSyncAsJob(
+  kind: "catalog" | "color-terms",
+  payload: Record<string, unknown>,
+  merge: (current: unknown, event: any) => unknown,
+  setResult: (updater: unknown) => void,
+): Promise<unknown> {
+  const startRes = await fetch("/api/jobs/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind, payload }),
+  })
+  const startBody = await startRes.json().catch(() => ({}))
+  if (!startRes.ok || !startBody.ok || !startBody.jobId) {
+    throw new Error(startBody.error || `Falha ao disparar o job (HTTP ${startRes.status}).`)
+  }
+
+  const jobId = startBody.jobId as string
+  const mergedKeys = new Set<string>()
+
+  return new Promise((resolve, reject) => {
+    let stopped = false
+    const stop = () => {
+      stopped = true
+      clearInterval(interval)
+    }
+
+    const poll = async () => {
+      if (stopped) return
+      try {
+        const statusRes = await fetch(`/api/jobs/${jobId}`)
+        const statusBody = await statusRes.json().catch(() => ({}))
+        if (!statusRes.ok || !statusBody.ok) {
+          throw new Error(statusBody.error || `Falha ao consultar o job (HTTP ${statusRes.status}).`)
+        }
+        const job = statusBody.job as Record<string, any>
+
+        for (const item of (job.recentProducts as any[]) ?? []) {
+          const key = JSON.stringify(item)
+          if (mergedKeys.has(key)) continue
+          mergedKeys.add(key)
+          setResult((current: unknown) => merge(current, { type: "product_done", product: item, term: item, stats: job.stats }))
+        }
+
+        setResult((current: unknown) => merge(current, job.progress ?? { type: "queued" }))
+
+        if (job.status === "done") {
+          stop()
+          resolve(job.report)
+        } else if (job.status === "error") {
+          stop()
+          reject(new Error(job.errorMessage || "O job terminou com erro."))
+        }
+      } catch (err) {
+        stop()
+        reject(err)
+      }
+    }
+
+    const interval = setInterval(poll, JOB_POLL_INTERVAL_MS)
+    poll()
+  })
+}
+
 export function ImportTester() {
   const [endpoints, setEndpoints] = useState<Endpoints>(initialEndpoints)
   const [logs, setLogs] = useState<LogEntry[]>([])
@@ -498,6 +564,56 @@ export function ImportTester() {
     const startedAt = performance.now()
     let finalReport: unknown = null
 
+    if (USE_CLOUD_RUN_JOBS) {
+      setColorTermsResult({
+        ok: true,
+        streaming: true,
+        stats: {},
+        colorTerms: [],
+        progress: { type: "started", processed: 0, total: 0 },
+      })
+
+      try {
+        const report = await runSyncAsJob("color-terms", payload, mergeColorTermsProgress, setColorTermsResult)
+        finalReport = {
+          ...(report as Record<string, unknown> | null ?? {}),
+          streaming: false,
+          progress: { type: "done", processed: 0, total: 0 },
+        }
+        setColorTermsResult(finalReport)
+        addLog(label, "POST", requestSummary, {
+          ok: true,
+          status: 200,
+          statusText: "",
+          url: "/api/jobs/run",
+          durationMs: Math.round(performance.now() - startedAt),
+          responseHeaders: {},
+          data: finalReport,
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Erro ao rodar o job de sincronizacao de cores."
+        setColorTermsResult((current: unknown) => ({
+          ...(current && typeof current === "object" ? (current as Record<string, unknown>) : {}),
+          ok: false,
+          streaming: false,
+          progress: { type: "fatal_error", message },
+        }))
+        addLog(label, "POST", requestSummary, {
+          ok: false,
+          status: 0,
+          statusText: "",
+          url: "/api/jobs/run",
+          durationMs: Math.round(performance.now() - startedAt),
+          responseHeaders: {},
+          data: null,
+          error: message,
+        })
+      } finally {
+        setBusy(null)
+      }
+      return
+    }
+
     setColorTermsResult({
       ok: true,
       streaming: true,
@@ -615,6 +731,53 @@ export function ImportTester() {
         elapsedMs: 0,
       },
     })
+
+    if (USE_CLOUD_RUN_JOBS) {
+      try {
+        const report = await runSyncAsJob("catalog", payload, mergeMigrationProgress, setMigrationResult)
+        finalReport = {
+          ...(report as Record<string, unknown> | null ?? {}),
+          streaming: false,
+          progress: {
+            type: "done",
+            processed: (report as any)?.processedProducts?.length ?? 0,
+            total: (report as any)?.processedProducts?.length ?? 0,
+            estimatedRemainingMs: 0,
+          },
+        }
+        setMigrationResult(finalReport)
+        addLog(label, "POST", requestSummary, {
+          ok: true,
+          status: 200,
+          statusText: "",
+          url: "/api/jobs/run",
+          durationMs: Math.round(performance.now() - startedAt),
+          responseHeaders: {},
+          data: finalReport,
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Erro ao rodar o job de migracao de catalogo."
+        setMigrationResult((current: unknown) => ({
+          ...(current && typeof current === "object" ? (current as Record<string, unknown>) : {}),
+          ok: false,
+          streaming: false,
+          progress: { type: "fatal_error", message },
+        }))
+        addLog(label, "POST", requestSummary, {
+          ok: false,
+          status: 0,
+          statusText: "",
+          url: "/api/jobs/run",
+          durationMs: Math.round(performance.now() - startedAt),
+          responseHeaders: {},
+          data: null,
+          error: message,
+        })
+      } finally {
+        setBusy(null)
+      }
+      return
+    }
 
     try {
       const res = await fetch("/api/sync/catalog", {
