@@ -30,7 +30,10 @@ export interface JobDoc {
 let firestore: Firestore | null = null
 
 function getFirestore(): Firestore {
-  if (!firestore) firestore = new Firestore()
+  if (!firestore) {
+    firestore = new Firestore()
+    firestore.settings({ ignoreUndefinedProperties: true })
+  }
   return firestore
 }
 
