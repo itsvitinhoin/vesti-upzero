@@ -77,6 +77,7 @@ function uid() {
 
 const USE_CLOUD_RUN_JOBS = process.env.NEXT_PUBLIC_USE_CLOUD_RUN_JOBS === "true"
 const JOB_POLL_INTERVAL_MS = 2000
+const JOB_STALE_TIMEOUT_MS = 20 * 60 * 1000
 
 async function runSyncAsJob(
   kind: "catalog" | "color-terms",
@@ -96,6 +97,8 @@ async function runSyncAsJob(
 
   const jobId = startBody.jobId as string
   const mergedKeys = new Set<string>()
+  let lastUpdatedAt: string | null = null
+  let lastChangeAt = Date.now()
 
   return new Promise((resolve, reject) => {
     let stopped = false
@@ -126,9 +129,24 @@ async function runSyncAsJob(
         if (job.status === "done") {
           stop()
           resolve(job.report)
-        } else if (job.status === "error") {
+          return
+        }
+        if (job.status === "error") {
           stop()
           reject(new Error(job.errorMessage || "O job terminou com erro."))
+          return
+        }
+
+        if (job.updatedAt !== lastUpdatedAt) {
+          lastUpdatedAt = job.updatedAt
+          lastChangeAt = Date.now()
+        } else if (Date.now() - lastChangeAt > JOB_STALE_TIMEOUT_MS) {
+          stop()
+          reject(
+            new Error(
+              "O job não reporta progresso há mais de 20 minutos e provavelmente foi interrompido (timeout, cancelamento ou erro no container). O job em si pode ainda estar rodando - confira em Cloud Run → Jobs para ver o status real da execução.",
+            ),
+          )
         }
       } catch (err) {
         stop()
