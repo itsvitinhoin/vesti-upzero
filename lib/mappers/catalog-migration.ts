@@ -24,7 +24,7 @@ export interface UpzeroVariantPayload {
   promotional_price?: string | null
   cost?: string | null
   attributes: Array<{
-    attribute: { name: string; code: string }
+    attribute: { id?: string; name: string; code: string }
     term: { name: string; code: string }
   }>
   active: boolean

@@ -3,6 +3,7 @@
 import { useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -24,6 +25,7 @@ import { PreviewTable } from "@/components/preview-table"
 import { LogPanel } from "@/components/log-panel"
 import { JsonViewer } from "@/components/json-viewer"
 import { DEFAULT_ENDPOINTS } from "@/lib/api-config"
+import { parseProductReferences } from "@/lib/sync/product-references"
 import type { Endpoints, LogEntry, ProxyResultClient } from "@/lib/types"
 import {
   Plug,
@@ -171,6 +173,7 @@ export function ImportTester() {
     startDate: "2016-01-01",
     endDate: new Date().toISOString().slice(0, 10),
     maxProducts: "25",
+    productReferences: "",
     productStatus: "all" as "all" | "active" | "inactive",
     includeImages: false,
     syncStock: true,
@@ -206,6 +209,9 @@ export function ImportTester() {
     .map(([label]) => label)
 
   const credentialsReady = missingCredentials.length === 0
+  const selectedReferences = parseProductReferences(migration.productReferences)
+  const referencesEntered = migration.productReferences.trim().length > 0
+  const invalidReferences = referencesEntered && selectedReferences.length === 0
 
   function updateEndpoint<K extends keyof Endpoints>(key: K, value: Endpoints[K]) {
     setEndpoints((e) => ({ ...e, [key]: value }))
@@ -440,6 +446,7 @@ export function ImportTester() {
   async function compareCatalog() {
     if (busy) return
     if (!ensureCredentials()) return
+    if (invalidReferences) return
     const maxProducts = migration.maxProducts.trim()
       ? Number(migration.maxProducts)
       : undefined
@@ -452,7 +459,8 @@ export function ImportTester() {
         realtime: true,
         startDate: migration.startDate,
         endDate: migration.endDate,
-        maxProducts,
+        maxProducts: selectedReferences.length ? undefined : maxProducts,
+        productReferences: referencesEntered ? selectedReferences : undefined,
         productStatus: migration.productStatus,
         includeImages: migration.mirrorMode || migration.includeImages,
         syncStock: migration.syncStock,
@@ -470,6 +478,7 @@ export function ImportTester() {
   async function sendCatalog() {
     if (busy) return
     if (!ensureCredentials()) return
+    if (invalidReferences) return
     const maxProducts = migration.maxProducts.trim()
       ? Number(migration.maxProducts)
       : undefined
@@ -482,7 +491,8 @@ export function ImportTester() {
         realtime: true,
         startDate: migration.startDate,
         endDate: migration.endDate,
-        maxProducts,
+        maxProducts: selectedReferences.length ? undefined : maxProducts,
+        productReferences: referencesEntered ? selectedReferences : undefined,
         productStatus: migration.productStatus,
         includeImages: migration.mirrorMode || migration.includeImages,
         syncStock: migration.syncStock,
@@ -1055,6 +1065,7 @@ export function ImportTester() {
                   min="1"
                   placeholder="vazio = todos"
                   value={migration.maxProducts}
+                  disabled={selectedReferences.length > 0}
                   onChange={(e) => setMigration((m) => ({ ...m, maxProducts: e.target.value }))}
                 />
               </div>
@@ -1076,6 +1087,25 @@ export function ImportTester() {
                   <option value="inactive">Somente inativos</option>
                 </select>
               </div>
+            </div>
+
+            <div className="grid gap-1.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label htmlFor="migrationReferences">Referências para importar</Label>
+                {selectedReferences.length > 0 ? <Badge variant="secondary">{selectedReferences.length} selecionadas</Badge> : null}
+              </div>
+              <Textarea
+                id="migrationReferences"
+                value={migration.productReferences}
+                onChange={(e) => setMigration((m) => ({ ...m, productReferences: e.target.value }))}
+                placeholder={"13409\n13422\n13.425"}
+                className="min-h-28 font-mono"
+                aria-invalid={invalidReferences}
+              />
+              {invalidReferences ? <p className="text-xs text-destructive">Informe ao menos uma referência válida.</p> : null}
+              <p className="text-xs text-muted-foreground">
+                Uma referência por linha, vírgula ou ponto e vírgula. Quando preenchido, Sync / comparar e Enviar Produtos usam somente essa lista; o limite é ignorado.
+              </p>
             </div>
 
             <div className="flex flex-wrap gap-4 text-sm">
@@ -1175,6 +1205,7 @@ export function ImportTester() {
               <ActionButton
                 onClick={compareCatalog}
                 loading={loading("Comparar catálogo")}
+                disabled={invalidReferences}
                 variant="default"
                 icon={<DatabaseZap className="size-4" />}
               >
@@ -1183,6 +1214,7 @@ export function ImportTester() {
               <ActionButton
                 onClick={sendCatalog}
                 loading={loading("Enviar produtos")}
+                disabled={invalidReferences}
                 variant="secondary"
                 icon={<Package className="size-4" />}
               >
@@ -1218,7 +1250,11 @@ export function ImportTester() {
               ) : null}
             </div>
 
-            {migration.maxProducts.trim() ? (
+            {selectedReferences.length > 0 ? (
+              <div className="rounded-md border border-yellow-500/40 bg-yellow-500/5 p-3 text-sm text-yellow-700">
+                Importação por referências: nenhuma limpeza global de produtos, cores ou tamanhos será executada. Os filtros de data e status Vesti continuam valendo.
+              </div>
+            ) : migration.maxProducts.trim() ? (
               <div className="rounded-md border border-yellow-500/40 bg-yellow-500/5 p-3 text-sm text-yellow-700">
                 Limpezas destrutivas, como remover cores extras, tamanhos extras ou arquivar produtos, só rodam quando o limite de produtos está vazio.
               </div>
@@ -1655,6 +1691,7 @@ function MigrationReport({ data, running }: { data: unknown; running: boolean })
   const warnings = products.filter((product: any) => rowState(product) === "warning")
   const breakdown = failureBreakdown(products)
   const ok = Boolean(report?.ok) && failed.length === 0
+  const missingReferences = Array.isArray(report?.filters?.missingReferences) ? report.filters.missingReferences : []
 
   if (!report) {
     return running ? (
@@ -1681,6 +1718,14 @@ function MigrationReport({ data, running }: { data: unknown; running: boolean })
         <Metric label="Termos removidos" value={String(stats.upzeroExtraAttributeTermsDeleted ?? 0)} />
         <Metric label="Produtos arquivados" value={String(stats.upzeroExtraProductsArchived ?? 0)} />
       </div>
+
+      {missingReferences.length > 0 ? (
+        <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
+          <div className="font-medium text-destructive">Referências não encontradas na Vesti</div>
+          <p className="mt-1 text-xs text-muted-foreground">Confira o período e o filtro de status. Nenhum produto fora da lista foi enviado.</p>
+          <p className="mt-2 break-words font-mono text-xs">{missingReferences.join(", ")}</p>
+        </div>
+      ) : null}
 
       {color ? (
         <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/20 p-3 text-sm">
@@ -2211,18 +2256,20 @@ function CredentialField({
 function ActionButton({
   onClick,
   loading,
+  disabled,
   icon,
   children,
   variant = "default",
 }: {
   onClick: () => void
   loading?: boolean
+  disabled?: boolean
   icon?: React.ReactNode
   children: React.ReactNode
   variant?: "default" | "outline" | "secondary"
 }) {
   return (
-    <Button onClick={onClick} disabled={loading} variant={variant} className="gap-2">
+    <Button onClick={onClick} disabled={loading || disabled} variant={variant} className="gap-2">
       {loading ? <Loader2 className="size-4 animate-spin" /> : icon}
       {children}
     </Button>

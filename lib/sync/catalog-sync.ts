@@ -1,6 +1,7 @@
 import { DEFAULT_ENDPOINTS } from "@/lib/api-config"
 import { proxyFetch, extractArray } from "@/lib/proxy"
 import { getExternalApiConfig } from "@/lib/server-api-config"
+import { parseProductReferences, referenceKey, selectProductsByReferences } from "@/lib/sync/product-references"
 import {
   collectTermsFromProducts,
   mapVestiCategoryForMigration,
@@ -35,6 +36,7 @@ export interface CatalogSyncRequest {
   pruneExtraAttributeTerms?: boolean
   archiveExtraProducts?: boolean
   productCode?: string
+  productReferences?: string[]
   latestFirst?: boolean
 }
 
@@ -140,6 +142,25 @@ export interface ColorTermCheck {
   upzeroRgb: string | null
   matches: boolean
   issue?: "missing_in_upzero" | "missing_rgb_in_vesti" | "rgb_mismatch"
+}
+
+type CatalogAttributeCode = "color" | "size"
+
+interface UpzeroAttributeRegistryEntry {
+  id: string | null
+  code: string
+  name: string
+  termsByCode: Map<string, AnyRecord>
+  termsByName: Map<string, AnyRecord>
+}
+
+type UpzeroAttributeRegistry = Map<CatalogAttributeCode, UpzeroAttributeRegistryEntry>
+
+interface MissingVariantTerm {
+  sku: string
+  attributeCode: string
+  termCode: string
+  termName: string
 }
 
 export interface CatalogSyncProgress {
@@ -724,10 +745,12 @@ function isVestiUnexpectedApiResponse(result: Awaited<ReturnType<typeof proxyFet
 
 async function fetchVestiProducts(
   req: Required<Pick<CatalogSyncRequest, "startDate" | "endDate" | "windowDays" | "perPage">> &
-    Pick<CatalogSyncRequest, "maxProducts" | "latestFirst">,
+    Pick<CatalogSyncRequest, "maxProducts" | "latestFirst" | "productStatus" | "productReferences">,
   stats: CatalogSyncStats,
 ) {
   const products = new Map<string, AnyRecord>()
+  const requestedReferences = new Set((req.productReferences ?? []).map(referenceKey))
+  const foundReferences = new Set<string>()
   const start = parseDate(req.startDate)
   const end = parseDate(req.endDate)
   const windowDays = Math.min(Math.max(req.windowDays, 1), MAX_WINDOW_DAYS)
@@ -777,11 +800,24 @@ async function fetchVestiProducts(
 
       for (const product of pageProducts) {
         const id = productIdentity(product)
+        if (requestedReferences.size) {
+          const keys = [referenceKey(product.code), referenceKey(product.integration_id)]
+          if (!keys.some((key) => requestedReferences.has(key))) continue
+          if (!productMatchesStatus(product, req.productStatus)) continue
+          keys.forEach((key) => {
+            if (requestedReferences.has(key)) foundReferences.add(key)
+          })
+        }
         if (id) products.set(id, product)
-        if (req.maxProducts && products.size >= req.maxProducts) {
+        if (!requestedReferences.size && req.maxProducts && products.size >= req.maxProducts) {
           stats.uniqueProducts = products.size
           return req.latestFirst ? sortProductsByLatest(Array.from(products.values())).slice(0, req.maxProducts) : Array.from(products.values())
         }
+      }
+
+      if (requestedReferences.size && foundReferences.size === requestedReferences.size) {
+        stats.uniqueProducts = products.size
+        return Array.from(products.values())
       }
 
       const data = result.data as AnyRecord
@@ -939,11 +975,15 @@ async function syncCategories(
   return idsByExternalId
 }
 
-async function syncAttributesAndTerms(products: AnyRecord[], dryRun: boolean, stats: CatalogSyncStats) {
+async function syncAttributesAndTerms(
+  products: AnyRecord[],
+  dryRun: boolean,
+  stats: CatalogSyncStats,
+): Promise<UpzeroAttributeRegistry> {
   const terms = collectTermsFromProducts(products)
   if (dryRun) {
     stats.upzeroTermsSkipped = terms.colors.length + terms.sizes.length
-    return
+    return loadUpzeroAttributeRegistry(stats)
   }
 
   for (const attribute of [
@@ -971,8 +1011,10 @@ async function syncAttributesAndTerms(products: AnyRecord[], dryRun: boolean, st
     ["size", terms.sizes],
   ] as const) {
     const attributes = await fetchUpzeroAttributes(stats)
-    const attribute = attributes.find((item: AnyRecord) =>
-      isAttribute(item, attributeCode, attributeCode === "color" ? "cor" : "tamanho"),
+    const attribute = findUpzeroAttribute(
+      attributes,
+      attributeCode,
+      attributeCode === "color" ? "cor" : "tamanho",
     )
     const attributeId = attribute ? upzeroAttributeId(attribute) : null
 
@@ -989,6 +1031,8 @@ async function syncAttributesAndTerms(products: AnyRecord[], dryRun: boolean, st
       if (result.ok) stats.upzeroTermsCreated += 1
     }
   }
+
+  return loadUpzeroAttributeRegistry(stats)
 }
 
 async function fetchUpzeroAttributes(stats: CatalogSyncStats) {
@@ -1012,6 +1056,93 @@ function isAttribute(attribute: AnyRecord, code: string, fallbackName: string) {
   const attributeCode = String(attribute.code || "").toLowerCase()
   const attributeName = String(attribute.name || "").toLowerCase()
   return attributeCode === code || attributeName === fallbackName.toLowerCase()
+}
+
+function findUpzeroAttribute(attributes: AnyRecord[], code: string, fallbackName: string) {
+  const expectedCode = code.toLowerCase()
+  return (
+    attributes.find((attribute) => String(attribute.code || "").toLowerCase() === expectedCode) ??
+    attributes.find((attribute) => isAttribute(attribute, code, fallbackName))
+  )
+}
+
+async function loadUpzeroAttributeRegistry(stats: CatalogSyncStats): Promise<UpzeroAttributeRegistry> {
+  const registry: UpzeroAttributeRegistry = new Map()
+  const attributes = await fetchUpzeroAttributes(stats)
+
+  for (const [attributeCode, fallbackName] of [
+    ["color", "cor"],
+    ["size", "tamanho"],
+  ] as const) {
+    const attribute = findUpzeroAttribute(attributes, attributeCode, fallbackName)
+    if (!attribute) continue
+
+    const embeddedTerms = Array.isArray(attribute.terms) ? attribute.terms : []
+    const listedTerms = await fetchUpzeroAttributeTerms(attribute, attributeCode, stats)
+    const terms = [...embeddedTerms, ...listedTerms]
+    const termsByCode = new Map<string, AnyRecord>()
+    const termsByName = new Map<string, AnyRecord>()
+
+    for (const term of terms) {
+      const codeKey = normalizedToken(term.code)
+      const nameKey = normalizedToken(term.name)
+      if (codeKey && !termsByCode.has(codeKey)) termsByCode.set(codeKey, term)
+      if (nameKey && !termsByName.has(nameKey)) termsByName.set(nameKey, term)
+    }
+
+    registry.set(attributeCode, {
+      id: upzeroAttributeId(attribute),
+      code: String(attribute.code || attributeCode),
+      name: String(attribute.name || (attributeCode === "color" ? "Cor" : "Tamanho")),
+      termsByCode,
+      termsByName,
+    })
+  }
+
+  return registry
+}
+
+function canonicalizeProductVariantTerms(
+  product: UpzeroProductPayload,
+  registry: UpzeroAttributeRegistry,
+): { product: UpzeroProductPayload; missing: MissingVariantTerm[] } {
+  const missing: MissingVariantTerm[] = []
+  const variants = product.variants.map((variant) => ({
+    ...variant,
+    attributes: variant.attributes.map((assignment) => {
+      const attributeCode = normalizedAttributeCode(assignment) as CatalogAttributeCode
+      const registeredAttribute = registry.get(attributeCode)
+      const requestedCode = normalizedToken(assignment.term.code)
+      const requestedName = normalizedToken(assignment.term.name)
+      const registeredTerm =
+        registeredAttribute?.termsByCode.get(requestedCode) ??
+        registeredAttribute?.termsByName.get(requestedName)
+
+      if (!registeredAttribute || !registeredTerm) {
+        missing.push({
+          sku: variant.sku,
+          attributeCode,
+          termCode: assignment.term.code,
+          termName: assignment.term.name,
+        })
+        return assignment
+      }
+
+      return {
+        attribute: {
+          ...(registeredAttribute.id ? { id: registeredAttribute.id } : {}),
+          name: registeredAttribute.name,
+          code: registeredAttribute.code,
+        },
+        term: {
+          name: String(registeredTerm.name || assignment.term.name),
+          code: String(registeredTerm.code || assignment.term.code),
+        },
+      }
+    }),
+  }))
+
+  return { product: { ...product, variants }, missing }
 }
 
 async function fetchUpzeroAttributeTerms(attribute: AnyRecord, attributeCode: "color" | "size", stats: CatalogSyncStats) {
@@ -1041,7 +1172,7 @@ async function pruneExtraAttributeTerms(products: AnyRecord[], dryRun: boolean, 
     ["color", "cor", expected.colors],
     ["size", "tamanho", expected.sizes],
   ] as const) {
-    const attribute = attributes.find((item: AnyRecord) => isAttribute(item, attributeCode, fallbackName))
+    const attribute = findUpzeroAttribute(attributes, attributeCode, fallbackName)
     const attributeId = attribute ? upzeroAttributeId(attribute) : null
     if (!attribute || !attributeId) continue
 
@@ -1110,11 +1241,7 @@ async function pruneExtraAttributeTerms(products: AnyRecord[], dryRun: boolean, 
 
 async function fetchUpzeroColorTerms(stats: CatalogSyncStats) {
   const attributes = await fetchUpzeroAttributes(stats)
-  const colorAttribute = attributes.find((attribute: AnyRecord) => {
-    const code = String(attribute.code || "").toLowerCase()
-    const name = String(attribute.name || "").toLowerCase()
-    return code === "color" || name === "cor"
-  })
+  const colorAttribute = findUpzeroAttribute(attributes, "color", "cor")
 
   if (Array.isArray(colorAttribute?.terms)) return colorAttribute.terms
 
@@ -1374,7 +1501,7 @@ async function syncVariantColorTermRgb(
     collectTermsFromProducts([rawProduct]).colors.map((term) => [term.code, term]),
   )
   const attributes = await fetchUpzeroAttributes(stats)
-  const colorAttribute = attributes.find((attribute: AnyRecord) => isAttribute(attribute, "color", "cor"))
+  const colorAttribute = findUpzeroAttribute(attributes, "color", "cor")
   const colorAttributeId = colorAttribute ? upzeroAttributeId(colorAttribute) : null
   if (!colorAttributeId) return
   const upzeroColorTerms = await fetchUpzeroColorTerms(stats)
@@ -1678,6 +1805,7 @@ async function syncProducts(
   products: AnyRecord[],
   options: Pick<CatalogSyncRequest, "dryRun" | "compareOnly" | "includeImages" | "syncStock" | "replaceImages" | "deactivateExtraVariants">,
   stats: CatalogSyncStats,
+  attributeRegistry: UpzeroAttributeRegistry,
   categoryIdsByExternalId: Map<string, string>,
   internalCategoryIdsByExternalId: Map<string, string>,
   categoryNamesByExternalId: Map<string, string>,
@@ -1717,7 +1845,9 @@ async function syncProducts(
   }
 
   for (const rawProduct of products) {
-    const sourceProduct = mapVestiProductForMigration(rawProduct)
+    const mappedSourceProduct = mapVestiProductForMigration(rawProduct)
+    const canonicalized = canonicalizeProductVariantTerms(mappedSourceProduct, attributeRegistry)
+    const sourceProduct = canonicalized.product
     const inventoryItems = mapVestiInventoryForMigration(rawProduct)
     const images = mapVestiImagesForMigration(rawProduct)
     const videos = mapVestiVideosForMigration(rawProduct)
@@ -1781,6 +1911,32 @@ async function syncProducts(
         ...baseReport,
         action: "skipped",
         error: "Produto sem código ou nome.",
+      })
+      continue
+    }
+
+    if (!options.dryRun && !options.compareOnly && canonicalized.missing.length > 0) {
+      const missingTerms = Array.from(
+        new Map(
+          canonicalized.missing.map((item) => [
+            `${item.attributeCode}:${normalizedToken(item.termCode)}:${normalizedToken(item.termName)}`,
+            item,
+          ]),
+        ).values(),
+      )
+      const missingSummary = missingTerms
+        .map((item) => `${item.attributeCode} '${item.termName}' (${item.termCode})`)
+        .join(", ")
+      const error = `Atributos/termos ainda não confirmados na UP Zero: ${missingSummary}.`
+      stats.errors.push({
+        step: "upzero.products.variant_terms.validate",
+        message: error,
+        context: { code: product.code, missing: canonicalized.missing },
+      })
+      await pushReport({
+        ...baseReport,
+        action: "error",
+        error,
       })
       continue
     }
@@ -1918,6 +2074,14 @@ async function syncProducts(
 
 export async function runCatalogSync(body: CatalogSyncRequest, onProgress?: CatalogSyncProgressHandler) {
   const dryRun = body.compareOnly ? true : body.dryRun !== false
+  const hasReferenceFilter = body.productReferences !== undefined || Boolean(String(body.productCode || "").trim())
+  const requestedReferences = body.productReferences !== undefined
+    ? parseProductReferences(body.productReferences)
+    : parseProductReferences(String(body.productCode || ""))
+  if (hasReferenceFilter && requestedReferences.length === 0) {
+    throw new Error("Informe pelo menos uma referência válida ou remova o filtro de referências.")
+  }
+  const effectiveMaxProducts = requestedReferences.length ? undefined : body.maxProducts
 
   const stats: CatalogSyncStats = {
     dryRun,
@@ -1961,8 +2125,10 @@ export async function runCatalogSync(body: CatalogSyncRequest, onProgress?: Cata
     endDate: body.endDate || todayIsoDate(),
     windowDays: body.windowDays || MAX_WINDOW_DAYS,
     perPage: body.perPage || 100,
-    maxProducts: body.maxProducts,
+    maxProducts: effectiveMaxProducts,
     latestFirst: body.latestFirst === true,
+    productStatus: body.productStatus || "all",
+    productReferences: requestedReferences,
   }
 
   await onProgress?.({
@@ -1977,18 +2143,28 @@ export async function runCatalogSync(body: CatalogSyncRequest, onProgress?: Cata
     fetchVestiCategories(stats),
     fetchVestiProducts(syncRequest, stats),
   ])
-  const requestedProductCode = String(body.productCode || "").trim()
   const statusFilter = body.productStatus || "all"
   const statusFilteredProducts = fetchedVestiProducts.filter((product) => productMatchesStatus(product, statusFilter))
-  const selectedVestiProducts = requestedProductCode
-    ? statusFilteredProducts.filter((product) => String(product.code || product.integration_id || "") === requestedProductCode)
+  const referenceSelection = requestedReferences.length
+    ? selectProductsByReferences(statusFilteredProducts, requestedReferences)
+    : null
+  const selectedVestiProducts = referenceSelection
+    ? referenceSelection.products
     : body.latestFirst
       ? sortProductsByLatest(statusFilteredProducts)
       : statusFilteredProducts
-  const vestiProducts = body.latestFirst && body.maxProducts && !requestedProductCode
+  const vestiProducts = body.latestFirst && body.maxProducts && !requestedReferences.length
     ? selectedVestiProducts.slice(0, body.maxProducts)
     : selectedVestiProducts
   stats.uniqueProducts = vestiProducts.length
+
+  if (referenceSelection?.missing.length) {
+    stats.errors.push({
+      step: "vesti.references.not_found",
+      message: `Referências não encontradas na Vesti para o período e status selecionados: ${referenceSelection.missing.join(", ")}.`,
+      context: { missingReferences: referenceSelection.missing },
+    })
+  }
 
   await onProgress?.({
     type: "source_loaded",
@@ -1999,8 +2175,34 @@ export async function runCatalogSync(body: CatalogSyncRequest, onProgress?: Cata
     message: `${vestiProducts.length} produtos carregados da Vesti.`,
   })
 
+  if (requestedReferences.length && vestiProducts.length === 0) {
+    const report = {
+      ok: false,
+      filters: {
+        productStatus: statusFilter,
+        startDate: syncRequest.startDate,
+        endDate: syncRequest.endDate,
+        maxProducts: effectiveMaxProducts ?? null,
+        latestFirst: body.latestFirst === true,
+        productReferences: requestedReferences,
+        missingReferences: referenceSelection?.missing ?? requestedReferences,
+      },
+      stats,
+      colorTermChecks: { checked: 0, matches: 0, mismatches: 0, missingRgbInVesti: 0, terms: [] },
+      processedProducts: [],
+      sample: { product: null, inventoryItems: [], images: [], productWithImages: null },
+    }
+    await onProgress?.({ type: "done", processed: 0, total: 0, elapsedMs: 0, estimatedRemainingMs: 0, stats })
+    return report
+  }
+
   const mappedCategories = new Map<string, UpzeroCategoryPayload>()
-  for (const category of vestiCategories) {
+  const vestiCategoryByExternalId = new Map(
+    flattenCategories(vestiCategories)
+      .map(mapVestiCategoryForMigration)
+      .map((category) => [category.external_ref.external_id, category]),
+  )
+  for (const category of requestedReferences.length ? [] : vestiCategories) {
     const mapped = mapVestiCategoryForMigration(category)
     mappedCategories.set(mapped.external_ref.external_id, mapped)
   }
@@ -2008,14 +2210,30 @@ export async function runCatalogSync(body: CatalogSyncRequest, onProgress?: Cata
   for (const product of vestiProducts) {
     for (const category of product.categories ?? []) {
       const mapped = mapVestiCategoryForMigration(category)
-      mappedCategories.set(mapped.external_ref.external_id, mapped)
+      mappedCategories.set(
+        mapped.external_ref.external_id,
+        requestedReferences.length ? vestiCategoryByExternalId.get(mapped.external_ref.external_id) ?? mapped : mapped,
+      )
+    }
+  }
+  if (requestedReferences.length) {
+    for (const category of [...mappedCategories.values()]) {
+      let parentId = category.parent_external_id
+      const visited = new Set<string>()
+      while (parentId && !visited.has(parentId)) {
+        visited.add(parentId)
+        const parent = vestiCategoryByExternalId.get(parentId)
+        if (!parent) break
+        mappedCategories.set(parentId, parent)
+        parentId = parent.parent_external_id
+      }
     }
   }
 
   const categoryNamesByExternalId = new Map(
     Array.from(mappedCategories.values()).map((category) => [category.external_ref.external_id, category.name]),
   )
-  await syncAttributesAndTerms(vestiProducts, dryRun, stats)
+  const attributeRegistry = await syncAttributesAndTerms(vestiProducts, dryRun, stats)
   const categoryIdsByExternalId = await syncCategories(Array.from(mappedCategories.values()), dryRun, stats)
   const internalCategoryIdsByExternalId = await syncCategories(
     Array.from(mappedCategories.values()),
@@ -2024,7 +2242,7 @@ export async function runCatalogSync(body: CatalogSyncRequest, onProgress?: Cata
     DEFAULT_ENDPOINTS.upzero.internalCategories,
     "upzero.internal_categories",
   )
-  const shouldLoadUpzeroProductIndex = body.compareOnly || body.archiveExtraProducts
+  const shouldLoadUpzeroProductIndex = body.compareOnly || (body.archiveExtraProducts && !body.maxProducts && !requestedReferences.length)
   const upzeroProductsByCode = shouldLoadUpzeroProductIndex ? await loadUpzeroProductsByCode(stats) : undefined
   await onProgress?.({
     type: "products_started",
@@ -2040,15 +2258,16 @@ export async function runCatalogSync(body: CatalogSyncRequest, onProgress?: Cata
     syncStock: body.syncStock !== false,
     replaceImages: body.replaceImages === true,
     deactivateExtraVariants: body.deactivateExtraVariants === true,
-  }, stats, categoryIdsByExternalId, internalCategoryIdsByExternalId, categoryNamesByExternalId, upzeroProductsByCode, onProgress)
+  }, stats, attributeRegistry, categoryIdsByExternalId, internalCategoryIdsByExternalId, categoryNamesByExternalId, upzeroProductsByCode, onProgress)
 
-  const canRunGlobalDestructiveCleanup = !body.maxProducts
+  const canRunGlobalDestructiveCleanup = !body.maxProducts && !requestedReferences.length
   if ((body.archiveExtraProducts || body.pruneExtraAttributeTerms) && !canRunGlobalDestructiveCleanup) {
     stats.warnings.push({
       step: "sync.mirror_cleanup",
-      message: "Limpeza destrutiva global ignorada porque maxProducts limita o catálogo. Remova o limite para espelhar a Vesti inteira.",
+      message: "Limpeza destrutiva global ignorada porque há limite de produtos ou filtro de referências. Use o catálogo completo para limpar itens extras.",
       context: {
         maxProducts: body.maxProducts,
+        productReferences: requestedReferences,
         archiveExtraProducts: body.archiveExtraProducts,
         pruneExtraAttributeTerms: body.pruneExtraAttributeTerms,
       },
@@ -2078,8 +2297,10 @@ export async function runCatalogSync(body: CatalogSyncRequest, onProgress?: Cata
       productStatus: statusFilter,
       startDate: syncRequest.startDate,
       endDate: syncRequest.endDate,
-      maxProducts: body.maxProducts ?? null,
+      maxProducts: effectiveMaxProducts ?? null,
       latestFirst: body.latestFirst === true,
+      productReferences: requestedReferences,
+      missingReferences: referenceSelection?.missing ?? [],
     },
     stats,
     colorTermChecks,
