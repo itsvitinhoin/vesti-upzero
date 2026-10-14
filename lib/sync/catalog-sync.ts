@@ -858,18 +858,40 @@ async function loadUpzeroCategoryIndex(
   endpoint = DEFAULT_ENDPOINTS.upzero.categories,
   stepPrefix = "upzero.categories",
 ) {
-  const result = await safeProxy(`${stepPrefix}.list`, stats, {
-    ...getExternalApiConfig("upzero"),
-    endpoint,
-    method: "GET",
-  })
-
   const byExternalId = new Map<string, AnyRecord>()
   const byVisibleName = new Map<string, AnyRecord>()
   const all: AnyRecord[] = []
-  if (!result.ok) return { byExternalId, byVisibleName, all }
 
-  for (const category of flattenCategories(extractArray(result.data))) {
+  const items: AnyRecord[] = []
+  const seenIds = new Set<string>()
+  let cursor = ""
+  for (let page = 0; page < 200; page += 1) {
+    const result = await safeProxy(`${stepPrefix}.list`, stats, {
+      ...getExternalApiConfig("upzero"),
+      endpoint: `${endpoint}?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+      method: "GET",
+    })
+    if (!result.ok) {
+      if (page === 0) return { byExternalId, byVisibleName, all }
+      break
+    }
+
+    const pageItems = extractArray(result.data)
+    const newItems = pageItems.filter((item) => {
+      const id = upzeroCategoryId(unwrapApiObject(item) ?? item)
+      if (!id) return true
+      if (seenIds.has(id)) return false
+      seenIds.add(id)
+      return true
+    })
+    items.push(...newItems)
+
+    const data = result.data as AnyRecord
+    cursor = String(data?.next_cursor || data?.nextCursor || "")
+    if (!cursor || newItems.length === 0) break
+  }
+
+  for (const category of flattenCategories(items)) {
     const normalizedCategory = unwrapApiObject(category) ?? category
     all.push(normalizedCategory)
 
@@ -941,12 +963,14 @@ async function syncCategories(
         localVisibleByName.set(categoryNameKey, localExisting.get(externalId) as AnyRecord)
       }
     } else {
-      const result = await safeProxy(`${stepPrefix}.create`, stats, {
+      const createRequest = {
         ...getExternalApiConfig("upzero"),
         endpoint,
-        method: "POST",
+        method: "POST" as const,
         body: payload,
-      })
+      }
+      const errorContext = { categoryName: category.name, externalId, parentExternalId: category.parent_external_id ?? null }
+      const result = await proxyFetch(createRequest)
       if (result.ok) {
         stats.upzeroCategoriesCreated += 1
         const createdCategory = unwrapApiObject(result.data)
@@ -955,6 +979,31 @@ async function syncCategories(
           id: upzeroCategoryId(createdCategory) ?? undefined,
         })
         localVisibleByName.set(categoryNameKey, localExisting.get(externalId) as AnyRecord)
+      } else if (result.status === 409) {
+        // Já existe categoria com o mesmo slug/pai: reaproveita em vez de falhar.
+        const refreshed = await loadUpzeroCategoryIndex(stats, endpoint, stepPrefix)
+        const sameParentId = String(parentId ?? "")
+        const conflicting = refreshed.all.find((candidate) => {
+          const candidateParentId = String(candidate.parent_id ?? candidate.parent?.id ?? candidate.data?.parent_id ?? "")
+          return normalizedCategoryKey(candidate.name) === categoryNameKey && candidateParentId === sameParentId
+        })
+        const conflictingId = upzeroCategoryId(conflicting)
+        if (conflicting && conflictingId) {
+          const updateResult = await safeProxy(`${stepPrefix}.update`, stats, {
+            ...getExternalApiConfig("upzero"),
+            endpoint: `${endpoint}/${conflictingId}`,
+            method: "PUT",
+            body: payload,
+          }, errorContext)
+          const recovered = updateResult.ok ? unwrapApiObject(updateResult.data) ?? conflicting : conflicting
+          if (updateResult.ok) stats.upzeroCategoriesUpdated += 1
+          localExisting.set(externalId, { ...recovered, id: upzeroCategoryId(recovered) ?? conflictingId })
+          localVisibleByName.set(categoryNameKey, localExisting.get(externalId) as AnyRecord)
+        } else {
+          addProxyError(stats, `${stepPrefix}.create`, result, errorContext)
+        }
+      } else {
+        addProxyError(stats, `${stepPrefix}.create`, result, errorContext)
       }
     }
   }
@@ -1465,7 +1514,7 @@ async function syncVariants(productId: string, product: UpzeroProductPayload, st
     const variantId = found ? upzeroVariantId(found) : null
 
     if (variantId) {
-      const result = await safeProxy("upzero.variants.update", stats, {
+      const result = await safeProxyWithRetry("upzero.variants.update", stats, {
         ...getExternalApiConfig("upzero"),
         endpoint: `/external/v1/variants/${encodeURIComponent(variantId)}`,
         method: "PATCH",
@@ -1625,9 +1674,14 @@ async function syncImages(
       ),
     )
 
-  const imagesToCreate = replaceImages
+  // As fotos sobem como base64, então a UP Zero guarda a própria URL e quase nunca casa com a da Vesti.
+  // Por isso a contagem é a trava: sem ela, rodar de novo duplica as fotos do produto.
+  const missingByUrl = replaceImages
     ? images
     : images.filter((image) => !imageCandidateUrls(image).some((url) => existingUrls.has(url)))
+  const matchedByUrl = images.length - missingByUrl.length
+  const coveredByCount = replaceImages ? 0 : Math.max(0, existingImages.length - matchedByUrl)
+  const imagesToCreate = missingByUrl.slice(coveredByCount)
   if (!replaceImages) stats.upzeroImagesSkipped += images.length - imagesToCreate.length
 
   for (const image of imagesToCreate) {

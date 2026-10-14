@@ -175,7 +175,7 @@ export function ImportTester() {
     maxProducts: "25",
     productReferences: "",
     productStatus: "all" as "all" | "active" | "inactive",
-    includeImages: false,
+    includeImages: true,
     syncStock: true,
     replaceImages: false,
     deactivateExtraVariants: false,
@@ -703,6 +703,12 @@ export function ImportTester() {
         }
       }
 
+      if (!finalReport) {
+        throw new Error(
+          "A conexão foi encerrada antes do fim da sincronização (provável limite de tempo do servidor, ex.: 300s na Vercel). Para catálogos grandes, rode em servidor persistente (Docker) ou via Cloud Run Job.",
+        )
+      }
+
       addLog(label, "POST", requestSummary, {
         ok: true,
         status: res.status,
@@ -855,6 +861,12 @@ export function ImportTester() {
             setMigrationResult((current: unknown) => mergeMigrationProgress(current, event))
           }
         }
+      }
+
+      if (!finalReport) {
+        throw new Error(
+          "A conexão foi encerrada antes do fim da sincronização (provável limite de tempo do servidor, ex.: 300s na Vercel). Para catálogos grandes, rode em servidor persistente (Docker) ou via Cloud Run Job.",
+        )
       }
 
       addLog(label, "POST", requestSummary, {
@@ -1706,10 +1718,15 @@ function MigrationReport({ data, running }: { data: unknown; running: boolean })
       {progress ? <MigrationProgressPanel progress={progress} products={products} running={running || report?.streaming} /> : null}
 
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-        <Metric label="Resultado" value={ok ? "OK" : "Falha"} tone={ok ? "ok" : "error"} />
+        <Metric
+          label="Resultado"
+          value={ok ? "OK" : apiErrors.length ? "Falha" : "Com divergências"}
+          tone={ok ? "ok" : apiErrors.length ? "error" : "warn"}
+        />
         <Metric label="Produtos" value={String(stats.uniqueProducts ?? products.length ?? 0)} />
         <Metric label="Atualizados/criados" value={`${stats.upzeroProductsUpdated ?? 0}/${stats.upzeroProductsCreated ?? 0}`} />
-        <Metric label="Erros/avisos" value={`${failed.length}/${warnings.length}`} tone={failed.length ? "error" : warnings.length ? "warn" : "ok"} />
+        <Metric label="Divergências/avisos" value={`${failed.length}/${warnings.length}`} tone={failed.length ? "error" : warnings.length ? "warn" : "ok"} />
+        <Metric label="Erros de API" value={String(apiErrors.length)} tone={apiErrors.length ? "error" : "ok"} />
         <Metric label="Variações" value={`${stats.upzeroVariantsCreated ?? 0}/${stats.upzeroVariantsUpdated ?? 0}`} />
         <Metric label="Estoque" value={`${stats.upzeroInventoryItems ?? 0} itens`} />
         <Metric label="Imagens novas" value={`${stats.upzeroImagesCreated ?? 0} upload`} />
@@ -1775,7 +1792,7 @@ function MigrationReport({ data, running }: { data: unknown; running: boolean })
 
       {failed.length ? (
         <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
-          <div className="font-medium text-destructive">Produtos com falha</div>
+          <div className="font-medium text-destructive">Produtos com divergência</div>
           <div className="mt-2 grid gap-2">
             {failed.slice(0, 12).map((product: any, index: number) => (
               <div key={`${product.code ?? "produto"}-${index}`} className="flex flex-wrap items-center gap-2 text-xs">
@@ -1862,7 +1879,7 @@ function MigrationProgressPanel({
         </div>
         <div className="flex flex-wrap gap-2">
           <Badge variant="secondary">{processed}/{total || "?"} produtos</Badge>
-          <Badge variant={failed ? "destructive" : "default"}>{failed} falhas</Badge>
+          <Badge variant={failed ? "destructive" : "default"}>{failed} divergências</Badge>
           <Badge variant="outline">{warnings} avisos</Badge>
           <Badge variant="outline">{finishedOk} OK</Badge>
         </div>
